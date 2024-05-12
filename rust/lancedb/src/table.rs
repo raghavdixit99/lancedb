@@ -14,6 +14,7 @@
 
 //! LanceDB Table APIs
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -40,10 +41,12 @@ use lance::io::WrappingObjectStore;
 use lance_index::IndexType;
 use lance_index::{optimize::OptimizeOptions, DatasetIndexExt};
 use log::info;
+use serde::{Deserialize, Serialize};
 use snafu::whatever;
 
 use crate::arrow::IntoArrow;
 use crate::connection::NoData;
+use crate::embeddings::{EmbeddingDefinition, EmbeddingRegistry, MaybeEmbedded, MemoryRegistry};
 use crate::error::{Error, Result};
 use crate::index::vector::{IvfPqIndexBuilder, VectorIndex, VectorIndexStatistics};
 use crate::index::IndexConfig;
@@ -61,6 +64,79 @@ use self::merge::MergeInsertBuilder;
 
 pub(crate) mod dataset;
 pub mod merge;
+
+/// Defines the type of column
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ColumnKind {
+    /// Columns populated by data from the user (this is the most common case)
+    Physical,
+    /// Columns populated by applying an embedding function to the input
+    Embedding(EmbeddingDefinition),
+}
+
+/// Defines a column in a table
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ColumnDefinition {
+    /// The source of the column data
+    pub kind: ColumnKind,
+}
+
+#[derive(Debug, Clone)]
+pub struct TableDefinition {
+    pub column_definitions: Vec<ColumnDefinition>,
+    pub schema: SchemaRef,
+}
+
+impl TableDefinition {
+    pub fn new(schema: SchemaRef, column_definitions: Vec<ColumnDefinition>) -> Self {
+        Self {
+            column_definitions,
+            schema,
+        }
+    }
+
+    pub fn new_from_schema(schema: SchemaRef) -> Self {
+        let column_definitions = schema
+            .fields()
+            .iter()
+            .map(|_| ColumnDefinition {
+                kind: ColumnKind::Physical,
+            })
+            .collect();
+        Self::new(schema, column_definitions)
+    }
+
+    pub fn try_from_rich_schema(schema: SchemaRef) -> Result<Self> {
+        let column_definitions = schema.metadata.get("lancedb::column_definitions");
+        if let Some(column_definitions) = column_definitions {
+            let column_definitions: Vec<ColumnDefinition> =
+                serde_json::from_str(column_definitions).map_err(|e| Error::Runtime {
+                    message: format!("Failed to deserialize column definitions: {}", e),
+                })?;
+            Ok(Self::new(schema, column_definitions))
+        } else {
+            let column_definitions = schema
+                .fields()
+                .iter()
+                .map(|_| ColumnDefinition {
+                    kind: ColumnKind::Physical,
+                })
+                .collect();
+            Ok(Self::new(schema, column_definitions))
+        }
+    }
+
+    pub fn into_rich_schema(self) -> SchemaRef {
+        // We have full control over the structure of column definitions.  This should
+        // not fail, except for a bug
+        let lancedb_metadata = serde_json::to_string(&self.column_definitions).unwrap();
+        let mut schema_with_metadata = (*self.schema).clone();
+        schema_with_metadata
+            .metadata
+            .insert("lancedb::column_definitions".to_string(), lancedb_metadata);
+        Arc::new(schema_with_metadata)
+    }
+}
 
 /// Optimize the dataset.
 ///
@@ -131,6 +207,7 @@ pub struct AddDataBuilder<T: IntoArrow> {
     pub(crate) data: T,
     pub(crate) mode: AddDataMode,
     pub(crate) write_options: WriteOptions,
+    embedding_registry: Option<Arc<dyn EmbeddingRegistry>>,
 }
 
 impl<T: IntoArrow> std::fmt::Debug for AddDataBuilder<T> {
@@ -162,6 +239,7 @@ impl<T: IntoArrow> AddDataBuilder<T> {
             mode: self.mode,
             parent: self.parent,
             write_options: self.write_options,
+            embedding_registry: self.embedding_registry,
         };
         parent.add(without_data, data).await
     }
@@ -279,6 +357,7 @@ pub(crate) trait TableInternal: std::fmt::Display + std::fmt::Debug + Send + Syn
     async fn checkout(&self, version: u64) -> Result<()>;
     async fn checkout_latest(&self) -> Result<()>;
     async fn restore(&self) -> Result<()>;
+    async fn table_definition(&self) -> Result<TableDefinition>;
 }
 
 /// A Table is a collection of strong typed Rows.
@@ -287,6 +366,7 @@ pub(crate) trait TableInternal: std::fmt::Display + std::fmt::Debug + Send + Syn
 #[derive(Clone)]
 pub struct Table {
     inner: Arc<dyn TableInternal>,
+    embedding_registry: Arc<dyn EmbeddingRegistry>,
 }
 
 impl std::fmt::Display for Table {
@@ -297,7 +377,20 @@ impl std::fmt::Display for Table {
 
 impl Table {
     pub(crate) fn new(inner: Arc<dyn TableInternal>) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            embedding_registry: Arc::new(MemoryRegistry::new()),
+        }
+    }
+
+    pub(crate) fn new_with_embedding_registry(
+        inner: Arc<dyn TableInternal>,
+        embedding_registry: Arc<dyn EmbeddingRegistry>,
+    ) -> Self {
+        Self {
+            inner,
+            embedding_registry,
+        }
     }
 
     /// Cast as [`NativeTable`], or return None it if is not a [`NativeTable`].
@@ -339,6 +432,7 @@ impl Table {
             data: batches,
             mode: AddDataMode::Append,
             write_options: WriteOptions::default(),
+            embedding_registry: Some(self.embedding_registry.clone()),
         }
     }
 
@@ -742,11 +836,10 @@ impl Table {
 
 impl From<NativeTable> for Table {
     fn from(table: NativeTable) -> Self {
-        Self {
-            inner: Arc::new(table),
-        }
+        Self::new(Arc::new(table))
     }
 }
+
 /// A table in a LanceDB database.
 #[derive(Debug, Clone)]
 pub struct NativeTable {
@@ -756,6 +849,8 @@ pub struct NativeTable {
 
     // the object store wrapper to use on write path
     store_wrapper: Option<Arc<dyn WrappingObjectStore>>,
+
+    storage_options: HashMap<String, String>,
 
     // This comes from the connection options. We store here so we can pass down
     // to the dataset when we recreate it (for example, in checkout_latest).
@@ -822,6 +917,13 @@ impl NativeTable {
             None => params,
         };
 
+        let storage_options = params
+            .store_options
+            .clone()
+            .unwrap_or_default()
+            .storage_options
+            .unwrap_or_default();
+
         let dataset = DatasetBuilder::from_uri(uri)
             .with_read_params(params)
             .load()
@@ -840,6 +942,7 @@ impl NativeTable {
             uri: uri.to_string(),
             dataset,
             store_wrapper: write_store_wrapper,
+            storage_options,
             read_consistency_interval,
         })
     }
@@ -907,6 +1010,12 @@ impl NativeTable {
             Some(wrapper) => params.patch_with_store_wrapper(wrapper)?,
             None => params,
         };
+        let storage_options = params
+            .store_params
+            .clone()
+            .unwrap_or_default()
+            .storage_options
+            .unwrap_or_default();
 
         let dataset = Dataset::write(batches, uri, Some(params))
             .await
@@ -921,6 +1030,7 @@ impl NativeTable {
             uri: uri.to_string(),
             dataset: DatasetConsistencyWrapper::new_latest(dataset, read_consistency_interval),
             store_wrapper: write_store_wrapper,
+            storage_options,
             read_consistency_interval,
         })
     }
@@ -1038,6 +1148,26 @@ impl NativeTable {
     pub async fn count_unindexed_rows(&self, index_uuid: &str) -> Result<Option<usize>> {
         match self.load_index_stats(index_uuid).await? {
             Some(stats) => Ok(Some(stats.num_unindexed_rows)),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn get_index_type(&self, index_uuid: &str) -> Result<Option<String>> {
+        match self.load_index_stats(index_uuid).await? {
+            Some(stats) => Ok(Some(stats.index_type)),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn get_distance_type(&self, index_uuid: &str) -> Result<Option<String>> {
+        match self.load_index_stats(index_uuid).await? {
+            Some(stats) => Ok(Some(
+                stats
+                    .indices
+                    .iter()
+                    .map(|i| i.metric_type.clone())
+                    .collect(),
+            )),
             None => Ok(None),
         }
     }
@@ -1303,6 +1433,11 @@ impl TableInternal for NativeTable {
         Ok(Arc::new(Schema::from(&lance_schema)))
     }
 
+    async fn table_definition(&self) -> Result<TableDefinition> {
+        let schema = self.schema().await?;
+        TableDefinition::try_from_rich_schema(schema)
+    }
+
     async fn count_rows(&self, filter: Option<String>) -> Result<usize> {
         Ok(self.dataset.get().await?.count_rows(filter).await?)
     }
@@ -1312,13 +1447,28 @@ impl TableInternal for NativeTable {
         add: AddDataBuilder<NoData>,
         data: Box<dyn RecordBatchReader + Send>,
     ) -> Result<()> {
-        let lance_params = add.write_options.lance_write_params.unwrap_or(WriteParams {
+        let data =
+            MaybeEmbedded::try_new(data, self.table_definition().await?, add.embedding_registry)?;
+
+        let mut lance_params = add.write_options.lance_write_params.unwrap_or(WriteParams {
             mode: match add.mode {
                 AddDataMode::Append => WriteMode::Append,
                 AddDataMode::Overwrite => WriteMode::Overwrite,
             },
             ..Default::default()
         });
+
+        // Bring storage options from table
+        let storage_options = lance_params
+            .store_params
+            .get_or_insert(Default::default())
+            .storage_options
+            .get_or_insert(Default::default());
+        for (key, value) in self.storage_options.iter() {
+            if !storage_options.contains_key(key) {
+                storage_options.insert(key.clone(), value.clone());
+            }
+        }
 
         // patch the params if we have a write store wrapper
         let lance_params = match self.store_wrapper.clone() {
@@ -1327,8 +1477,8 @@ impl TableInternal for NativeTable {
         };
 
         self.dataset.ensure_mutable().await?;
-
         let dataset = Dataset::write(data, &self.uri, Some(lance_params)).await?;
+
         self.dataset.set_latest(dataset).await;
         Ok(())
     }

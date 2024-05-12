@@ -18,7 +18,7 @@ import inspect
 import os
 from abc import abstractmethod
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterable, List, Literal, Optional, Union
+from typing import TYPE_CHECKING, Dict, Iterable, List, Literal, Optional, Union
 
 import pyarrow as pa
 from overrides import EnforceOverrides, override
@@ -224,13 +224,23 @@ class DBConnection(EnforceOverrides):
     def __getitem__(self, name: str) -> LanceTable:
         return self.open_table(name)
 
-    def open_table(self, name: str) -> Table:
+    def open_table(self, name: str, *, index_cache_size: Optional[int] = None) -> Table:
         """Open a Lance Table in the database.
 
         Parameters
         ----------
         name: str
             The name of the table.
+        index_cache_size: int, default 256
+            Set the size of the index cache, specified as a number of entries
+
+            The exact meaning of an "entry" will depend on the type of index:
+            * IVF - there is one entry for each IVF partition
+            * BTREE - there is one entry for the entire index
+
+            This cache applies to the entire opened table, across all indices.
+            Setting this value higher will increase performance on larger datasets
+            at the expense of more RAM
 
         Returns
         -------
@@ -245,6 +255,18 @@ class DBConnection(EnforceOverrides):
         ----------
         name: str
             The name of the table.
+        """
+        raise NotImplementedError
+
+    def rename_table(self, cur_name: str, new_name: str):
+        """Rename a table in the database.
+
+        Parameters
+        ----------
+        cur_name: str
+            The current name of the table.
+        new_name: str
+            The new name of the table.
         """
         raise NotImplementedError
 
@@ -407,7 +429,9 @@ class LanceDBConnection(DBConnection):
         return tbl
 
     @override
-    def open_table(self, name: str) -> LanceTable:
+    def open_table(
+        self, name: str, *, index_cache_size: Optional[int] = None
+    ) -> LanceTable:
         """Open a table in the database.
 
         Parameters
@@ -419,7 +443,7 @@ class LanceDBConnection(DBConnection):
         -------
         A LanceTable object representing the table.
         """
-        return LanceTable.open(self, name)
+        return LanceTable.open(self, name, index_cache_size=index_cache_size)
 
     @override
     def drop_table(self, name: str, ignore_missing: bool = False):
@@ -533,6 +557,7 @@ class AsyncConnection(object):
         exist_ok: Optional[bool] = None,
         on_bad_vectors: Optional[str] = None,
         fill_value: Optional[float] = None,
+        storage_options: Optional[Dict[str, str]] = None,
     ) -> AsyncTable:
         """Create an [AsyncTable][lancedb.table.AsyncTable] in the database.
 
@@ -570,6 +595,12 @@ class AsyncConnection(object):
             One of "error", "drop", "fill".
         fill_value: float
             The value to use when filling vectors. Only used if on_bad_vectors="fill".
+        storage_options: dict, optional
+            Additional options for the storage backend. Options already set on the
+            connection will be inherited by the table, but can be overridden here.
+            See available options at
+            https://lancedb.github.io/lancedb/guides/storage/
+
 
         Returns
         -------
@@ -729,30 +760,53 @@ class AsyncConnection(object):
             mode = "exist_ok"
 
         if data is None:
-            new_table = await self._inner.create_empty_table(name, mode, schema)
+            new_table = await self._inner.create_empty_table(
+                name, mode, schema, storage_options=storage_options
+            )
         else:
             data = data_to_reader(data, schema)
             new_table = await self._inner.create_table(
                 name,
                 mode,
                 data,
+                storage_options=storage_options,
             )
 
         return AsyncTable(new_table)
 
-    async def open_table(self, name: str) -> Table:
+    async def open_table(
+        self,
+        name: str,
+        storage_options: Optional[Dict[str, str]] = None,
+        index_cache_size: Optional[int] = None,
+    ) -> Table:
         """Open a Lance Table in the database.
 
         Parameters
         ----------
         name: str
             The name of the table.
+        storage_options: dict, optional
+            Additional options for the storage backend. Options already set on the
+            connection will be inherited by the table, but can be overridden here.
+            See available options at
+            https://lancedb.github.io/lancedb/guides/storage/
+        index_cache_size: int, default 256
+            Set the size of the index cache, specified as a number of entries
+
+            The exact meaning of an "entry" will depend on the type of index:
+            * IVF - there is one entry for each IVF partition
+            * BTREE - there is one entry for the entire index
+
+            This cache applies to the entire opened table, across all indices.
+            Setting this value higher will increase performance on larger datasets
+            at the expense of more RAM
 
         Returns
         -------
         A LanceTable object representing the table.
         """
-        table = await self._inner.open_table(name)
+        table = await self._inner.open_table(name, storage_options, index_cache_size)
         return AsyncTable(table)
 
     async def drop_table(self, name: str):
